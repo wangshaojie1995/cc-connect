@@ -85,11 +85,12 @@ type piSession struct {
 	pendingErr string
 
 	// RPC-only fields (nil/zero when rpc=false)
-	rpcCmd     *exec.Cmd
-	rpcStdin   io.WriteCloser
-	rpcStdinMu sync.Mutex
-	stderrBuf  cappedStderrWriter
-	rpcReady   chan struct{} // closed once after handleEvent stores sessionId from the get_state probe written by startRPC
+	rpcCmd      *exec.Cmd
+	rpcStdin    io.WriteCloser
+	rpcStdinMu  sync.Mutex
+	stderrBuf   cappedStderrWriter
+	rpcWaitOnce sync.Once
+	rpcReady    chan struct{} // closed once after handleEvent stores sessionId from the get_state probe written by startRPC
 
 	// Extension UI: maps Pi's extension_ui_request id -> cc-connect RequestID
 	extPendingMu  sync.Mutex
@@ -238,12 +239,14 @@ func (s *piSession) startRPC(resumeID string) error {
 }
 
 func (s *piSession) killRPC() {
-	if s.rpcCmd != nil && s.rpcCmd.Process != nil {
-		if err := forceKillCmd(s.rpcCmd); err != nil {
-			slog.Warn("piSession: kill rpc process", "error", err)
+	s.rpcWaitOnce.Do(func() {
+		if s.rpcCmd != nil && s.rpcCmd.Process != nil {
+			if err := forceKillCmd(s.rpcCmd); err != nil {
+				slog.Warn("piSession: kill rpc process", "error", err)
+			}
+			_ = s.rpcCmd.Wait() // Join os/exec stderr copying before readLoopRPC reads stderrBuf.
 		}
-		_, _ = s.rpcCmd.Process.Wait()
-	}
+	})
 }
 
 // readLoopRPC is the persistent RPC readLoop goroutine.
@@ -331,7 +334,11 @@ func (s *piSession) Send(msg string, messageID string, images []core.ImageAttach
 	if safeMessageID := sanitizePiAttachmentName(messageID); safeMessageID != "" {
 		attachDir = filepath.Join(attachDir, safeMessageID)
 	}
-	cleanAttachments(attachDir)
+	// Text-only supplements (such as /ps) must preserve attachments that
+	// the running task may still be reading, especially with no message ID.
+	if len(images) > 0 || len(files) > 0 {
+		cleanAttachments(attachDir)
+	}
 
 	// Issue #1723: images are passed via pi's @<path> argv / message-text
 	// mechanism. pi's processImage loads them as visual inputs and the
@@ -467,6 +474,8 @@ func (s *piSession) writeRPCCommand(cmd map[string]any) error {
 // sendRPC writes a JSON "prompt" command to the persistent RPC process stdin.
 // Events are read asynchronously by readLoopRPC, including agent_end which
 // triggers EventResult.
+// streamingBehavior lets Pi steer an active run or start a prompt if it has
+// already finished, even while the engine is still delivering the last reply.
 //
 // Issue #1723: image paths are embedded into the message text as
 // @<path> references (pi's standard mechanism, parsed the same way as in
@@ -482,8 +491,9 @@ func (s *piSession) writeRPCCommand(cmd map[string]any) error {
 // tools load only what the model actually needs.
 func (s *piSession) sendRPC(prompt string, imageAtFiles []string, filePaths []string) error {
 	cmd := map[string]any{
-		"type":    "prompt",
-		"message": composeRPCPrompt(promptWithFileRefs(prompt, filePaths), imageAtFiles),
+		"type":              "prompt",
+		"message":           composeRPCPrompt(promptWithFileRefs(prompt, filePaths), imageAtFiles),
+		"streamingBehavior": "steer",
 	}
 	slog.Debug("piSession: sending RPC prompt", "bytes", len(prompt))
 	return s.writeRPCCommand(cmd)

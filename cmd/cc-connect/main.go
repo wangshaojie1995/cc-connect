@@ -612,6 +612,13 @@ func main() {
 			if cfg.StreamPreview.DisabledPlatforms != nil {
 				spcfg.DisabledPlatforms = cfg.StreamPreview.DisabledPlatforms
 			}
+			if cfg.StreamPreview.StopBehavior != nil {
+				if !core.StopBehaviorIsValid(*cfg.StreamPreview.StopBehavior) {
+					slog.Error("invalid [stream_preview] stop_behavior: expected discard or freeze", "value", *cfg.StreamPreview.StopBehavior)
+					os.Exit(1)
+				}
+				spcfg.StopBehavior = *cfg.StreamPreview.StopBehavior
+			}
 			engine.SetStreamPreviewCfg(spcfg)
 		}
 
@@ -640,6 +647,7 @@ func main() {
 				})
 			}
 		}
+		applyDedupConfig(cfg, engine)
 		// Wire outgoing rate limiting
 		{
 			var maxPS float64
@@ -697,6 +705,12 @@ func main() {
 			engine.SetMaxTurnTime(time.Duration(*cfg.MaxTurnTimeMins) * time.Minute)
 		}
 
+		// Wire the /stop hook event. Unset keeps the historical default
+		// ("session.ended"); "turn.cancelled" opts in to the precise event.
+		if v := strings.TrimSpace(cfg.StopHookEvent); v != "" {
+			engine.SetStopHookEvent(core.HookEventType(strings.ToLower(v)))
+		}
+
 		// Wire queue depth
 		if cfg.Queue.MaxDepth != nil && *cfg.Queue.MaxDepth > 0 {
 			engine.SetMaxQueuedMessages(*cfg.Queue.MaxDepth)
@@ -714,6 +728,7 @@ func main() {
 			}
 			engine.SetAutoCompressConfigWithSource(true, maxTokens, minGap, proj.AutoCompress.AllowHeuristic)
 		}
+		applyHistoryBootstrapConfig(&proj, engine)
 		resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 		engine.SetResetOnIdle(resetIdle)
 		if defaulted {
@@ -1578,14 +1593,47 @@ func resolveClaudeProjectDir(workDir string) string {
 	if err != nil {
 		return ""
 	}
-	// Claude Code encodes paths by replacing os.PathSeparator with "-"
-	// e.g. /home/leigh/workspace/cc-connect -> -home-leigh-workspace-cc-connect
-	encoded := strings.ReplaceAll(workDir, string(os.PathSeparator), "-")
-	dir := filepath.Join(homeDir, ".claude", "projects", encoded)
-	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-		return ""
+	projectsBase := filepath.Join(homeDir, ".claude", "projects")
+	// Claude Code encodes paths by replacing '/', ':', '_', ' ', '~' and any
+	// non-ASCII rune with '-'. Replacing only os.PathSeparator misses common
+	// workdir shapes (snake_case dirs, spaces, '~/Library/Mobile Documents/...',
+	// non-ASCII directory names), causing the observer to silently disable.
+	encoded := encodeClaudeProjectKey(workDir)
+	dir := filepath.Join(projectsBase, encoded)
+	if info, err := os.Stat(dir); err == nil && info.IsDir() {
+		return dir
 	}
-	return dir
+	// Fall back to the legacy encoding for backward compatibility with on-disk
+	// project keys created before the encoder above.
+	legacy := strings.ReplaceAll(workDir, string(os.PathSeparator), "-")
+	if legacy != encoded {
+		dir = filepath.Join(projectsBase, legacy)
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+	}
+	return ""
+}
+
+// encodeClaudeProjectKey mirrors agent/claudecode.encodeClaudeProjectKey: it
+// normalizes backslashes to forward slashes, then replaces '/', ':', '_', ' ',
+// '~' and non-ASCII runes with '-'. Kept in sync manually because the agent
+// helper is unexported.
+func encodeClaudeProjectKey(absPath string) string {
+	normalized := strings.ReplaceAll(absPath, "\\", "/")
+	var b strings.Builder
+	b.Grow(len(normalized))
+	for _, r := range normalized {
+		switch {
+		case r == '/' || r == ':' || r == '_' || r == ' ' || r == '~':
+			b.WriteByte('-')
+		case r < 128:
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	return b.String()
 }
 
 // resolveConfigPath determines which config file to use.
@@ -1770,6 +1818,20 @@ func setupLogger(level string, w io.Writer) {
 	})))
 }
 
+func applyDedupConfig(cfg *config.Config, engine *core.Engine) {
+	enabled := cfg.Dedup.Enabled == nil || *cfg.Dedup.Enabled
+	windowSecs := 30
+	if cfg.Dedup.WindowSecs != nil && *cfg.Dedup.WindowSecs > 0 {
+		windowSecs = *cfg.Dedup.WindowSecs
+	}
+	engine.SetDedupConfig(enabled, time.Duration(windowSecs)*time.Second)
+}
+
+func applyHistoryBootstrapConfig(proj *config.ProjectConfig, engine *core.Engine) {
+	enabled := proj.HistoryBootstrap.Enabled == nil || *proj.HistoryBootstrap.Enabled
+	engine.SetHistoryBootstrap(enabled, derefInt(proj.HistoryBootstrap.MaxEntries), derefInt(proj.HistoryBootstrap.MaxTokens))
+}
+
 // reloadConfig re-reads config.toml and applies hot-reloadable settings
 // (display, providers, commands) to the given engine.
 func reloadConfig(configPath, projName string, engine *core.Engine) (*core.ConfigReloadResult, error) {
@@ -1835,6 +1897,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	} else {
 		engine.SetAutoCompressConfig(false, 0, 0)
 	}
+	applyHistoryBootstrapConfig(proj, engine)
 	resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 	engine.SetResetOnIdle(resetIdle)
 	if defaulted {
@@ -1864,12 +1927,22 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		engine.SetInstantReply(core.InstantReplyCfg{})
 	}
 
+	// Reload the /stop hook event. An empty value restores the default
+	// ("session.ended"), so removing the key from config.toml reverts the
+	// behavior just like a fresh start.
+	if v := strings.TrimSpace(cfg.StopHookEvent); v != "" {
+		engine.SetStopHookEvent(core.HookEventType(strings.ToLower(v)))
+	} else {
+		engine.SetStopHookEvent(core.HookEventSessionEnded)
+	}
+
 	// Reload sender injection
 	engine.SetInjectSender(proj.InjectSender != nil && *proj.InjectSender)
 
 	// Reload attachment send-back switch
 	engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
 
+	applyDedupConfig(cfg, engine)
 	// Reload filter_external_sessions
 	engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
 
